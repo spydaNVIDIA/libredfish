@@ -770,6 +770,9 @@ impl Redfish for Bmc {
             return Err(RedfishError::Lockdown);
         }
 
+        // clear any pending configs/jobs before changing the UEFI password
+        self.delete_job_queue().await?;
+
         self.s
             .change_bios_password(UEFI_PASSWORD_NAME, current_uefi_password, new_uefi_password)
             .await?;
