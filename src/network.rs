@@ -20,8 +20,9 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{borrow::Cow, collections::HashMap, path::Path, sync::OnceLock, time::Duration};
 
+use regex::Regex;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, IF_MATCH},
     multipart::{Form, Part},
@@ -501,7 +502,7 @@ impl RedfishHttpClient {
                 let body_enc =
                     serde_json::to_string(b).map_err(|e| RedfishError::JsonSerializeError {
                         url,
-                        object_debug: format!("{b:?}"),
+                        object_debug: redact_sensitive_fields(&format!("{b:?}")).into_owned(),
                         source: e,
                     })?;
 
@@ -513,7 +514,7 @@ impl RedfishHttpClient {
             "TX {} {} {}",
             method,
             url,
-            body_enc.as_deref().unwrap_or_default()
+            RedactPasswords(body_enc.as_deref().unwrap_or_default())
         );
         let mut req_b = match *method {
             Method::GET => self.http_client.get(&url),
@@ -588,7 +589,7 @@ impl RedfishHttpClient {
                 url: url.clone(),
                 source: e,
             })?;
-        debug!("RX {status_code} {}", truncate(&response_body, 1500));
+        debug!("RX {status_code} {}", truncate(&redact_sensitive_fields(&response_body), 1500));
 
         if !status_code.is_success() {
             if status_code == StatusCode::FORBIDDEN && !response_body.is_empty() {
@@ -739,7 +740,7 @@ impl RedfishHttpClient {
                 url: url.to_string(),
                 source: e,
             })?;
-        debug!("RX {status_code} {}", truncate(&response_body, 1500));
+        debug!("RX {status_code} {}", truncate(&redact_sensitive_fields(&response_body), 1500));
 
         if !status_code.is_success() {
             return Err(RedfishError::HTTPErrorCode {
@@ -757,10 +758,149 @@ fn truncate(s: &str, len: usize) -> &str {
     &s[..len.min(s.len())]
 }
 
-#[test]
-fn test_truncate() {
-    assert_eq!(truncate("", 1500), "");
+/// Redacts known sensitive JSON fields for safe logging.
+///
+/// Operates directly on the serialised JSON string to avoid re-serialisation
+/// cost.  Returns `Cow::Borrowed(body)` unchanged when no sensitive field
+/// names are present (zero-copy fast path).  The actual bytes sent over the
+/// wire are **never** modified — only the string passed to this function is
+/// affected.
+///
+/// Redacted fields (exact, case-sensitive JSON key match):
+///   `Password`, `OldPassword`, `NewPassword`   — standard Redfish account/BIOS ops
+///   `CurrentUefiPassword`, `UefiPassword`       — NVIDIA DPU Bios/Settings PATCH
+///   `ImportBuffer`                              — Dell ImportSystemConfiguration XML blob
 
-    let big = "a".repeat(2000);
-    assert_eq!(truncate(&big, 1500).len(), 1500);
+/// A `Display` wrapper that redacts sensitive JSON fields on formatting.
+///
+/// Passing this to `tracing::debug!` defers evaluation until the macro decides the
+/// message will actually be emitted, so the regex never runs at non-debug log levels.
+struct RedactPasswords<'a>(&'a str);
+
+impl std::fmt::Display for RedactPasswords<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        redact_sensitive_fields(self.0).fmt(f)
+    }
+}
+
+fn redact_sensitive_fields(body: &str) -> Cow<'_, str> {
+    // Fast path: skip regex engine entirely when no sensitive key is present.
+    // "Password" covers all five password-style keys; "ImportBuffer" covers the
+    // Dell XML-in-JSON fallback path.
+    if !body.contains("Password") && !body.contains("ImportBuffer") {
+        return Cow::Borrowed(body);
+    }
+
+    static REDACT_RE: OnceLock<Regex> = OnceLock::new();
+    let re = REDACT_RE.get_or_init(|| {
+        // Matches a JSON key from the sensitive list followed by its quoted string value
+        // (including JSON escape sequences).  The key is captured in group 1 so it can
+        // be preserved verbatim in the replacement.
+        Regex::new(
+            r#""(Password|OldPassword|NewPassword|CurrentUefiPassword|UefiPassword|ImportBuffer)"\s*:\s*"(?:[^"\\]|\\.)*""#,
+        )
+        .expect("hardcoded redaction regex must be valid")
+    });
+
+    re.replace_all(body, r#""$1":"[REDACTED]""#)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate() {
+        assert_eq!(truncate("", 1500), "");
+
+        let big = "a".repeat(2000);
+        assert_eq!(truncate(&big, 1500).len(), 1500);
+    }
+
+    #[test]
+    fn redact_password_field() {
+        let body = r#"{"UserName":"admin","Password":"s3cr3t!"}"#;
+        let redacted = redact_sensitive_fields(body);
+        assert!(!redacted.contains("s3cr3t!"), "plaintext password must not appear in log output");
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("UserName"), "non-sensitive fields must be preserved");
+    }
+
+    #[test]
+    fn redact_old_and_new_password_fields() {
+        let body =
+            r#"{"PasswordName":"AdministratorPassword","OldPassword":"old123","NewPassword":"new456"}"#;
+        let redacted = redact_sensitive_fields(body);
+        assert!(!redacted.contains("old123"), "OldPassword value must be redacted");
+        assert!(!redacted.contains("new456"), "NewPassword value must be redacted");
+        // PasswordName is a slot name, not a secret — must NOT be redacted.
+        assert!(redacted.contains("AdministratorPassword"), "PasswordName value must not be redacted");
+    }
+
+    #[test]
+    fn nvidia_dpu_uefi_password_fields_are_redacted() {
+        let body = r#"{"Attributes":{"CurrentUefiPassword":"old_secret","UefiPassword":"new_secret"}}"#;
+        let redacted = redact_sensitive_fields(body);
+        assert!(!redacted.contains("old_secret"), "CurrentUefiPassword value must be redacted");
+        assert!(!redacted.contains("new_secret"), "UefiPassword value must be redacted");
+        assert!(redacted.contains("CurrentUefiPassword"), "key name must be preserved");
+    }
+
+    #[test]
+    fn dell_import_buffer_xml_blob_is_redacted() {
+        let xml = r#"<SystemConfiguration><Component FQDD="BIOS.Setup.1-1"><Attribute Name="OldSetupPassword">my_uefi_pass</Attribute><Attribute Name="NewSetupPassword"></Attribute></Component></SystemConfiguration>"#;
+        let body = format!(
+            r#"{{"ShutdownType":"Forced","ShareParameters":{{"Target":"BIOS"}},"ImportBuffer":"{}"}}"#,
+            xml.replace('"', "\\\"")
+        );
+        let redacted = redact_sensitive_fields(&body);
+        assert!(!redacted.contains("my_uefi_pass"), "UEFI password in ImportBuffer XML must not appear in log output");
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("ShutdownType"), "non-sensitive fields must be preserved");
+    }
+
+    #[test]
+    fn non_sensitive_body_is_returned_borrowed() {
+        let body = r#"{"ResetType":"GracefulRestart"}"#;
+        match redact_sensitive_fields(body) {
+            Cow::Borrowed(s) => assert_eq!(s, body),
+            Cow::Owned(_) => panic!("non-sensitive body must take the zero-copy fast path"),
+        }
+    }
+
+    #[test]
+    fn empty_body_fast_path() {
+        match redact_sensitive_fields("") {
+            Cow::Borrowed(s) => assert_eq!(s, ""),
+            Cow::Owned(_) => panic!("empty string must take fast path"),
+        }
+    }
+
+    #[test]
+    fn wire_payload_is_unaffected() {
+        let body_enc = r#"{"UserName":"newuser","Password":"myP@ssw0rd"}"#.to_string();
+        let _log_safe = redact_sensitive_fields(&body_enc);
+        assert_eq!(body_enc, r#"{"UserName":"newuser","Password":"myP@ssw0rd"}"#,
+            "wire payload must never be modified");
+    }
+
+    #[test]
+    fn escaped_characters_in_password_are_redacted() {
+        let body = r#"{"Password":"p@ss\"w\\ord"}"#;
+        let redacted = redact_sensitive_fields(body);
+        assert!(!redacted.contains("p@ss"), "escaped password value must be redacted");
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn truncation_after_redaction_does_not_leak_partial_secret() {
+        let filler = "x".repeat(1490);
+        let secret = "supersecret_password_value";
+        let body = format!(r#"{{"Data":"{}","Password":"{}"}}"#, filler, secret);
+        assert!(body.len() > 1500, "body must exceed truncation limit for this test to be valid");
+
+        let redacted = redact_sensitive_fields(&body);
+        let logged = truncate(&redacted, 1500);
+        assert!(!logged.contains("supersecret"), "no part of the secret must appear after truncation");
+    }
 }
